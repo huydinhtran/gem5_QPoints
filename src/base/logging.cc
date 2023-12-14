@@ -44,6 +44,8 @@
 
 #include "base/hostinfo.hh"
 
+#include "base/statistics.hh"
+
 namespace gem5
 {
 
@@ -53,12 +55,12 @@ class ExitLogger : public Logger
 {
   public:
     using Logger::Logger;
-
   protected:
     void
     log(const Loc &loc, std::string s) override
     {
         std::stringstream ss;
+        statistics::dump();
         ccprintf(ss, "Memory Usage: %ld KBytes\n", memUsage());
         Logger::log(loc, s + ss.str());
     }
