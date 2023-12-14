@@ -58,6 +58,12 @@ from common.cores.arm import HPI
 import devices
 
 
+######################################
+from common import Simulation
+import sys
+import trace
+######################################
+
 default_kernel = 'vmlinux.arm64'
 default_disk = 'linaro-minimal-aarch64.img'
 default_root_device = '/dev/vda'
@@ -68,19 +74,23 @@ default_root_device = '/dev/vda'
 # the cache class may be 'None' if the particular cache is not present.
 cpu_types = {
 
-    "atomic" : ( AtomicSimpleCPU, None, None, None, None),
-    "minor" : (MinorCPU,
+    # "atomic" : (AtomicSimpleCPU, None, None, None, None),
+    "atomic" : (AtomicSimpleCPU,
+                devices.L1I, devices.L1D,
+               devices.WalkCache,
+               devices.L2),
+    "minor"  : (MinorCPU,
                devices.L1I, devices.L1D,
                devices.WalkCache,
                devices.L2),
-    "hpi" : ( HPI.HPI,
-              HPI.HPI_ICache, HPI.HPI_DCache,
-              HPI.HPI_WalkCache,
-              HPI.HPI_L2),
-    "ooo" : ( O3CPU,
+    "hpi"    : (HPI.HPI,
+               HPI.HPI_ICache, HPI.HPI_DCache,
+               HPI.HPI_WalkCache,
+               HPI.HPI_L2),
+    "ooo"    : (O3CPU,
                devices.L1I, devices.L1D,
                devices.WalkCache,
-               devices.L2)
+               devices.L2),
 }
 
 def create_cow_image(name):
@@ -88,7 +98,7 @@ def create_cow_image(name):
     image = CowDiskImage()
     image.child.image_file = SysPaths.disk(name)
 
-    return image;
+    return image
 
 
 def create(args):
@@ -127,22 +137,6 @@ def create(args):
     MemConfig.config_mem(args, system)
 
     system.realview.vio[0].vio=VirtIOBlock(image=create_cow_image(args.disk_image))
-    # Add the PCI devices we need for this system. The base system
-    # doesn't have any PCI devices by default since they are assumed
-    # to be added by the configuration scripts needing them.
-    #system.pci_devices = [
-    #    # Create a VirtIO block device for the system's boot
-    #    # disk. Attach the disk image using gem5's Copy-on-Write
-    #    # functionality to avoid writing changes to the stored copy of
-    #    # the disk image.
-    #    PciVirtIO(vio=VirtIOBlock(image=create_cow_image(args.disk_image))),
-    #]
-
-    ## Attach the PCI devices to the system. The helper method in the
-    ## system assigns a unique PCI bus ID to each of the devices and
-    ## connects them to the IO bus.
-    #for dev in system.pci_devices:
-    #    system.attach_pci(dev)
 
     # Wire up the system's memory system
     system.connect()
@@ -158,10 +152,11 @@ def create(args):
                            preserve_ways=args.preserve_ways,
                            args=args),
     ]
-
     # Create a cache hierarchy for the cluster. We are assuming that
     # clusters have core-private L1 caches and an L2 that's shared
     # within the cluster.
+    print("WANT_CACHES = ",want_caches)
+    want_caches = True
     system.addCaches(want_caches, last_cache_level=3)
 
     # Setup gem5's minimal Linux boot loader.
@@ -214,9 +209,6 @@ def parse_stats(args):
                 found = True
                 break
     stats_file_handle.close()
-    #os.remove(stats_file)
-    #with open(stats_file,'w') as fp:
-    #    pass
     return found
 
 def run(args):
@@ -281,16 +273,6 @@ def main():
                         help="Number of L1i sets")
     parser.add_argument("--num-cores", type=int, default=1,
                         help="Number of CPU cores")
-    #parser.add_argument("--mem-type", default="DDR3_1600_8x8",
-    #                    choices=ObjectList.mem_list.get_names(),
-    #                    help = "type of memory to use")
-    #parser.add_argument("--mem-channels", type=int, default=1,
-    #                    help = "number of memory channels")
-    #parser.add_argument("--mem-ranks", type=int, default=None,
-    #                    help = "number of memory ranks per channel")
-    #parser.add_argument("--mem-size", action="store", type=str,
-    #                    default="1GB",
-    #                    help="Specify the physical memory size")
     parser.add_argument("--checkpoint", action="store_true")
     parser.add_argument("--restore", type=str, default=None)
 
@@ -301,12 +283,85 @@ def main():
     root = Root(full_system=True)
     root.system = create(args)
 
+    
+    ###################################
+    timing_cpus   = [TimingSimpleCPU(switched_out=True, cpu_id=(i))
+                     for i in range(args.num_cpus)]
+    o3_cpus = [DerivO3CPU(switched_out=True, cpu_id=(i))
+                     for i in range(args.num_cpus)]
+
+    for i in range(args.num_cpus):
+        timing_cpus[i].system =  root.system
+        o3_cpus[i].system =  root.system
+        timing_cpus[i].workload = root.system.cpu_cluster[0].cpus[i].workload
+        o3_cpus[i].workload = root.system.cpu_cluster[0].cpus[i].workload
+        timing_cpus[i].clk_domain = root.system.cpu_cluster[0].cpus[i].clk_domain
+        o3_cpus[i].clk_domain = root.system.cpu_cluster[0].cpus[i].clk_domain
+        timing_cpus[i].isa = root.system.cpu_cluster[0].cpus[i].isa
+        o3_cpus[i].isa = root.system.cpu_cluster[0].cpus[i].isa
+
+
+        # simulation period
+        if args.maxinsts:
+            timing_cpus[i].max_insts_any_thread =  args.maxinsts
+            o3_cpus[i].max_insts_any_thread = args.maxinsts
+
+        # attach the checker cpu if selected
+        if args.checker:
+            timing_cpus[i].addCheckerCpu()
+            o3_cpus[i].addCheckerCpu()
+
+
+
+    root.system.timing_cpus = timing_cpus
+    root.system.o3_cpus = o3_cpus
+    atomic_to_timing = [
+        (root.system.cpu_cluster[0].cpus[i], timing_cpus[i]) for i in range(args.num_cpus)
+    ]
+    timing_to_o3 = [
+        (timing_cpus[i], o3_cpus[i]) for i in range(args.num_cpus)
+    ]
+    o3_to_atomic = [
+        (o3_cpus[i], root.system.cpu_cluster[0].cpus[i]) for i in range(args.num_cpus)
+    ]
+
     if args.restore is not None:
         m5.instantiate(args.restore)
     else:
         m5.instantiate()
 
-    run(args)
+
+    # # while(m5.curTick() < max_tick):
+    # print("Running with ATOMIC CPU")
+    # event = m5.simulate(10000000000)
+
+    # m5.switchCpus(root.system, atomic_to_timing)
+    # print("Running with TIMING CPU")
+    # event = m5.simulate(10000000000)
+
+    # m5.switchCpus(root.system, timing_to_o3)
+    # print("Running with O3 CPU")
+    # event = m5.simulate(10000000000)
+
+    # m5.switchCpus(root.system, o3_to_atomic)
+    # # print("Running with ATOMIC CPU")
+    # # event = m5.simulate(100000000000)
+
+    # exit_msg = event.getCause()
+    # print(exit_msg, " @ ", m5.curTick())
+    # m5.stats.dump()
+    # sys.exit(event.getCode())
+    ###################################
+    # run(args)
+    try:
+        event = m5.simulate()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        exit_msg = event.getCause()
+        print(exit_msg, " @ ", m5.curTick())
+        m5.stats.dump()
+        sys.exit(event.getCode())
 
 
 if __name__ == "__m5_main__":
